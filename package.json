@@ -1,0 +1,45 @@
+{
+  "name": "pi-ask-channel-reminder",
+  "version": "0.1.0",
+  "description": "Remind you on a pi-channels route (Feishu/DingTalk/WeCom/webhook) when ask_user_question has been waiting unanswered for too long. Reminders only; answering stays in the terminal.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ask-user-question",
+    "channels",
+    "feishu",
+    "notification"
+  ],
+  "main": "./index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Echokovo/pi-ask-channel-reminder.git"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

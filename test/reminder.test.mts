@@ -5,7 +5,7 @@ import test from "node:test";
 
 import extension, {
   buildReminderText,
-  buildResolvedText,
+  formatActivityTimeout,
   formatDuration,
   loadConfig,
   normalizeConfig,
@@ -41,15 +41,20 @@ test("normalizeConfig 忽略类型错误与越界的值，回落到默认", () =
     repeatMs: -1, // 越界 → 默认
     maxReminders: 999, // 越界 → 默认
     includeDescriptions: "yes", // 类型错 → 默认
-    notifyResolved: false,
   });
   assert.equal(cfg.route, "ops");
   assert.equal(cfg.afterMs, 180_000);
   assert.equal(cfg.repeatMs, 0);
   assert.equal(cfg.maxReminders, 1);
   assert.equal(cfg.includeDescriptions, false);
-  assert.equal(cfg.notifyResolved, false);
+  assert.equal(cfg.resetOnActivity, true);
+  assert.equal(cfg.afterActivityMs, 360000, "未配置时取 2 × afterMs");
   assert.equal(cfg.enabled, true);
+  assert.equal(normalizeConfig({ resetOnActivity: false }).resetOnActivity, false);
+  assert.equal(normalizeConfig({ afterMs: 10000 }).afterActivityMs, 20000);
+  assert.equal(normalizeConfig({ afterActivityMs: -1 }).afterActivityMs, -1);
+  assert.equal(normalizeConfig({ afterActivityMs: 0 }).afterActivityMs, 0);
+  assert.equal(normalizeConfig({ afterActivityMs: 600000 }).afterActivityMs, 600000);
 });
 
 test("normalizeQuestions 压平多行、跳过无问题项、保留多选标记", () => {
@@ -121,11 +126,6 @@ test("buildReminderText 多题编号、说明开关、无选项占位、超长�
   assert.ok(tiny.length < 400);
 });
 
-test("buildResolvedText 说明提醒次数与等待时长", () => {
-  assert.match(buildResolvedText({ question: "发布到哪个环境？", waitedMs: 420_000, sent: 2 }), /2 次提醒/);
-  assert.match(buildResolvedText({ question: "发布到哪个环境？", waitedMs: 420_000, sent: 1 }), /提醒后 7m00s/);
-});
-
 /* ── 事件接线：用假 EventBus + 假 pi-channels 走完整链路 ── */
 
 type Send = { adapter: string; text: string; source?: string };
@@ -182,8 +182,18 @@ function harness(settings: Record<string, unknown>) {
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-test("ask 超过 afterMs 未答 → 通过 channel:send 提醒；终端作答后补收尾并停表", async () => {
-  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000, notifyResolved: true } });
+type Harness = ReturnType<typeof harness>;
+
+async function startSession(pi: Harness["pi"], extraUi: Record<string, unknown> = {}) {
+  await pi.fire("session_start", {}, {
+    cwd: process.cwd(),
+    isProjectTrusted: () => false,
+    ui: { setStatus() {}, ...extraUi },
+  });
+}
+
+test("ask 超过 afterMs 未答 → 通过 channel:send 提醒；终端作答后停表且不再发消息", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
 
   await pi.fire("session_start", {}, { cwd: process.cwd(), isProjectTrusted: () => false, ui: { setStatus() {} } });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-1", questions: SAMPLE_QUESTIONS });
@@ -196,19 +206,32 @@ test("ask 超过 afterMs 未答 → 通过 channel:send 提醒；终端作答后
   assert.match(sends[0].text, /A\. 预发/);
   assert.match(sends[0].text, /测试会话/);
 
-  // 作答后 blocked 先关，tool_execution_end 再兜底：收尾消息只能有一条
+  // 作答后 blocked 先关，tool_execution_end 再兜底：只停表，不再发任何消息
   pi.events.emit("rpiv:ask-user:blocked", { active: false, toolCallId: "call-1" });
   await pi.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "call-1", toolName: "ask_user_question" });
   await wait(50);
-  assert.equal(sends.length, 2);
-  assert.match(sends[1].text, /✅ pi 的问题已处理/);
+  assert.equal(sends.length, 1);
 
   await wait(1200);
-  assert.equal(sends.length, 2, "已收口后不应再发，也不应重复收尾");
+  assert.equal(sends.length, 1, "已收口后不应再发");
 });
 
-test("无 toolCallId 的 blocked 事件把所有等待收口，且 notifyResolved 关闭时不发收尾", async () => {
-  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000, notifyResolved: false } });
+test("tool_execution_end 单独到达也能停表，不发消息", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
+  await startSession(pi);
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-end", questions: SAMPLE_QUESTIONS });
+  await wait(300);
+  await pi.fire("tool_execution_end", {
+    type: "tool_execution_end",
+    toolCallId: "call-end",
+    toolName: "ask_user_question",
+  });
+  await wait(1200);
+  assert.equal(sends.length, 0, "tool_execution_end 应停表且不发消息");
+});
+
+test("无 toolCallId 的 blocked 事件把所有等待收口，且不发任何消息", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-a", questions: SAMPLE_QUESTIONS });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-b", questions: SAMPLE_QUESTIONS });
   pi.events.emit("rpiv:ask-user:blocked", { active: false });
@@ -218,7 +241,7 @@ test("无 toolCallId 的 blocked 事件把所有等待收口，且 notifyResolve
 
 test("重复提醒按 repeatMs 续期，达到 maxReminders 后停止", async () => {
   const { pi, sends } = harness({
-    "pi-ask-reminder": { route: "ops", afterMs: 1000, repeatMs: 1000, maxReminders: 2, notifyResolved: false },
+    "pi-ask-reminder": { route: "ops", afterMs: 1000, repeatMs: 1000, maxReminders: 2 },
   });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-r", questions: SAMPLE_QUESTIONS });
   await wait(1300);
@@ -238,9 +261,9 @@ test("enabled=false 时完全不监听", async () => {
   assert.equal(sends.length, 0);
 });
 
-test("发送失败时不发收尾消息，也不谎报成功", async () => {
+test("发送失败时不谎报成功，也不额外发消息", async () => {
   const { pi, sends, sendResults } = harness({
-    "pi-ask-reminder": { route: "ghost", afterMs: 1000, notifyResolved: true },
+    "pi-ask-reminder": { route: "ghost", afterMs: 1000 },
   });
   sendResults.push({ ok: false, error: 'No adapter "ghost"' });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-fail", questions: SAMPLE_QUESTIONS });
@@ -255,7 +278,7 @@ test("项目设置（已信任）覆盖 agent 目录设置", async () => {
   const project = mkdtempSync(join(process.env.TMP_ROOT ?? "/tmp/pi", "pi-ask-reminder-project-"));
   mkdirSync(join(project, ".pi"), { recursive: true });
   writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({ "pi-ask-reminder": { route: "private-chat" } }));
-  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000, notifyResolved: false } });
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
 
   await pi.fire("session_start", {}, { cwd: project, isProjectTrusted: () => true, ui: { setStatus() {} } });
   pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-proj", questions: SAMPLE_QUESTIONS });
@@ -269,6 +292,108 @@ test("项目设置（已信任）覆盖 agent 目录设置", async () => {
   untrusted.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-untrusted", questions: SAMPLE_QUESTIONS });
   await wait(1300);
   assert.equal(untrustedSends[0]?.adapter, "ops");
+});
+
+test("afterActivityMs=0 时按键后仍按 afterMs 顺延", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000, afterActivityMs: 0 } });
+  let press: ((data: string) => void) | undefined;
+  await startSession(pi, {
+    onTerminalInput(handler: (data: string) => void) {
+      press = handler;
+      return () => { press = undefined; };
+    },
+  });
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-key", questions: SAMPLE_QUESTIONS });
+  await wait(700);
+  assert.ok(press, "session_start 应订阅原始按键");
+  press("\x1b[B");
+  await wait(700);
+  assert.equal(sends.length, 0, "按键后重新计时，未满 afterMs 不应发送");
+  await wait(500);
+  assert.equal(sends.length, 1, "按键后满 afterMs 才提醒");
+});
+
+test("默认 afterActivityMs = 2×afterMs：按键后按两倍时长顺延", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
+  let press: ((data: string) => void) | undefined;
+  await startSession(pi, {
+    onTerminalInput(handler: (data: string) => void) {
+      press = handler;
+      return () => { press = undefined; };
+    },
+  });
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-double", questions: SAMPLE_QUESTIONS });
+  await wait(700);
+  assert.ok(press);
+  press("\x1b[A");
+  await wait(1400);
+  assert.equal(sends.length, 0, "按键后应等 2×afterMs，而不是 afterMs");
+  await wait(700);
+  assert.equal(sends.length, 1);
+});
+
+test("afterActivityMs=-1 时按键后不再提醒", async () => {
+  const { pi, sends } = harness({
+    "pi-ask-reminder": { route: "ops", afterMs: 1000, afterActivityMs: -1 },
+  });
+  let press: ((data: string) => void) | undefined;
+  await startSession(pi, {
+    onTerminalInput(handler: (data: string) => void) {
+      press = handler;
+      return () => { press = undefined; };
+    },
+  });
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-never", questions: SAMPLE_QUESTIONS });
+  await wait(700);
+  assert.ok(press);
+  press("\x1b[A");
+  await wait(1500);
+  assert.equal(sends.length, 0, "活动过就不应再提醒");
+});
+
+test("afterActivityMs=-1 时首条提醒后按键也会停掉重复", async () => {
+  const { pi, sends } = harness({
+    "pi-ask-reminder": {
+      route: "ops",
+      afterMs: 1000,
+      repeatMs: 1000,
+      maxReminders: 3,
+      afterActivityMs: -1,
+    },
+  });
+  let press: ((data: string) => void) | undefined;
+  await startSession(pi, {
+    onTerminalInput(handler: (data: string) => void) {
+      press = handler;
+      return () => { press = undefined; };
+    },
+  });
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-never-2", questions: SAMPLE_QUESTIONS });
+  await wait(1200);
+  assert.equal(sends.length, 1);
+  assert.ok(press);
+  press("\x1b[B");
+  await wait(1500);
+  assert.equal(sends.length, 1, "活动过之后不应再重复提醒");
+});
+
+test("formatActivityTimeout 描述活动后的策略", () => {
+  assert.equal(formatActivityTimeout(normalizeConfig({})), "6m00s");
+  assert.equal(formatActivityTimeout(normalizeConfig({ afterActivityMs: -1 })), "不再提醒");
+  assert.equal(formatActivityTimeout(normalizeConfig({ afterActivityMs: 0 })), "同首条");
+});
+
+test("ui_prompt_start 让计时从真正上屏时重新开始", async () => {
+  const { pi, sends } = harness({ "pi-ask-reminder": { route: "ops", afterMs: 1000 } });
+  await startSession(pi);
+  pi.events.emit("rpiv:ask-user:prompt", { toolCallId: "call-mount", questions: SAMPLE_QUESTIONS });
+  pi.events.emit("rpiv:ask-user:blocked", { active: true, toolCallId: "call-mount" });
+  await wait(700);
+  await pi.fire("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "custom" });
+  await wait(700);
+  assert.equal(sends.length, 0, "上屏后应重新计满 afterMs");
+  await wait(500);
+  assert.equal(sends.length, 1);
 });
 
 test("loadConfig 对坏 JSON 与缺失文件保持默认值", () => {
